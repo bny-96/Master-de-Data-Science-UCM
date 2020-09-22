@@ -1,0 +1,1081 @@
+---
+title: "Prediciendo el estado de las bombas de agua en Tanzania"
+author: "Pablo Benayas"
+date: "26 de Abril de 2020"
+output:
+  html_document:
+    df_print: paged
+    toc_depth: 3
+    number_sections: true 
+    theme: flatly
+    highlight: textmate
+    fig_width: 10
+    fig_height: 10
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+```{r librerias, include=FALSE, include=FALSE}
+library(missRanger)
+library(data.table) 
+library(inspectdf)
+library(dplyr)     
+library(caret)
+library(ggmosaic)
+library(corrplot)
+library(rpart)
+library(ggfortify)
+library(rattle)
+library(lubridate)
+library(plyr)
+library(DataExplorer)
+library(patchwork)
+library(stringr)
+library(forcats)
+library(fastDummies)
+library(stringdist)
+library(recipes) 
+library(tidyr)
+library(leaflet)
+library(ranger)
+library(missRanger)
+library(gridExtra) 
+library(repr) 
+library(ggplot2)
+library(hash) 
+library(stringdist) 
+library(stringi) 
+library(purrr)
+library(repurrrsive)
+library(data.table)
+library(inspectdf)
+library(plyr)
+library(dplyr)
+library(ranger)
+library(caret) 
+library(dataPreparation)
+library(stringi)
+library(hash) 
+library(xgboost)
+library(readr)
+library(caret)
+library(car) 
+library(xgboost)
+library(Matrix)
+library(MatrixModels)
+```
+
+```{r funciones}
+Histograma_categorias <- function(variable, titulo){
+  ggplot(data=train, aes(x=variable, group=train$status_group, fill=train$status_group)) + geom_density(adjust=1.5, alpha=.4) + scale_fill_manual(values=c("#56B4E9", "#E69F00", "#999999")) +
+    ggtitle(titulo)
+}
+
+Mosaico <- function(var,target,nombreEje){
+  ds <- table(var, target)
+  ord <- order(apply(ds, 1, sum), decreasing=TRUE)
+  mosaicplot(ds[ord,], color=c("#56B4E9", "#E69F00", "#999999"), las=2, main="",xlab=nombreEje)
+}
+```
+
+# Objetivo
+Este ejercicio describe cómo nuestro grupo ha abordado el problema para la competición en drivendata: ['Pump it Up: Data Mining the Water Table'](https://www.drivendata.org/competitions/7/pump-it-up-data-mining-the-water-table/page/24/).
+
+El objetivo de la competición es predecir el estado de las bombas en Tanzania a partir de los datos de Taarifa, un API de consulta que, para esta competición, ha agregado datos sobre estado de las bombas de agua de Tanzani, datos provenientes del Ministerio del Agua.
+
+El ejercicio es un problema de clasificación multiclase y consiste en predecir el estado de las bombas entre tres categorías: 'funcional', 'funcional necesita reparación' y 'no funcional'.
+
+# Cómo construimos este documento
+
+Hemos dividido este documento en 2 partes, la primera, 'Acercamiento grupal', es el trabajo que hemos realizado en conjunto los miembros del grupo. Esta parte explica los tratamientos realizados a los datos y los modelos desarrollados para 2 sprints.
+
+La segunda parte, 'Aporte adicional individual', incluye aportes adicionales del autor al código grupal. 
+
+Para cada sección se adjuntan capturas de pantalla con los puntajes alcanzados en la plataforma.
+
+# Importación de datos
+Utilizamos la función fread del paquete 'data.table' para importar los datos. Debido a que sabemos que el dataset necesitará transformaciones, tanto en los datos de 'train' como de 'test', unimos ambos dejando los valores de la variable objetivo para el test con el texto: 'test'.
+
+```{r importa_datos}
+# Importamos los datos usando fread:
+labels <- as.data.frame(fread('C:/Users/pablo/Desktop/label.csv'))
+train <- as.data.frame(fread('C:/Users/pablo/Desktop/train.csv'))
+test <- as.data.frame(fread('C:/Users/pablo/Desktop/test.csv'))
+
+## Añadimos la variable objetivo al train:
+train <- inner_join(train, labels, by = "id")
+
+## Para combinar train y test, podemos usar rbind.fill o crear valores ficticios para 'status_group' en el test:
+test$status_group <- c('test')
+
+## Combinamos train y test:
+tt <- rbind(train, test)
+```
+
+
+# EDA
+## Dimensiones de los conjuntos de datos
+Primero revisamos las dimensiones de los data frames (el data frame de train tiene 1 variable más, que es la variable target 'status group'): 
+```{r dims}
+print(paste('El data frame de train tiene', dim(train)[1], 'filas y', dim(train)[2], 'variables'))
+print(paste('El data frame de test tiene', dim(test)[1], 'filas y', dim(test)[2], 'variables'))
+print(paste('El data frame combinado "tt" tiene', dim(tt)[1], 'filas y', dim(tt)[2], 'variables'))
+```
+
+## Tipos de variables
+Según el **tipo de variables,** 29 son categóricas, 10 numéricas y 2 lógicas. 
+
+```{r col_types, fig.height=7, fig.width=10}
+# Generamos una figura con el tipo de datos por columna
+bars_plot <- inspect_types(tt)
+show_plot(bars_plot)
+```
+
+## Balance de clases de la variable target
+La variable target es una variable de tipo categórico con 3 valores. Hay pocos casos para la categoría 'functional needs repair'.
+
+```{r target_balance, fig.height=7, fig.width=10}
+target_table <- as.data.frame(round(prop.table(table(train$status_group)),4)*100)
+names(target_table) <- c('status_group', 'Frequency')
+ggplot(target_table, aes(x=status_group, y=Frequency, fill=status_group)) +
+  geom_bar(stat="identity", color="black") +
+  scale_fill_manual(values=c("#56B4E9", "#E69F00", "#999999")) +
+  geom_text(aes(label=paste(Frequency, '%', sep='')), vjust=1.6, color="white", size=3.5) +
+  ggtitle('Balance de clases de la variable target')
+```
+
+## Frecuencias de otras variables categóricas
+La siguiente figura muestra la **frecuencia de valores en cada variable categórica o lógica**. De inicio, variables como 'funder', 'installer', 'date_recorded', 'scheme_name', 'subvillage', 'ward' y 'wpt_name' muestran un número alto de valores diferentes. También se puede ver la baja varianza en otras columnas como 'recorded_by'.
+
+```{r cat_freqs}
+# Generamos una figura de inspección de variables categóricas 
+cat_plot <- inspect_cat(tt)
+show_plot(cat_plot)
+```
+
+Para complemetar la figura anterior anterior, debajo se muestra el valor más frecuente en cada variable categórica. 'recorded_by' tiene un solo valor, por tanto su varianza cero. 'management_group', 'public_meeting', 'water_quality', 'quality group' y 'cource_class' tienen un solo valor con frecuencia superior al 75%. Como esperado, 'subvillage' y 'ward' tienen muchísimos valores únicos y el valor con más frecuencia tiene muy poca representación.
+
+```{r modes}
+# Generamos una figura con los valores más comunes en cada variable categórica
+imb_plot <- inspect_imb(tt)
+show_plot(imb_plot)
+```
+
+## Correlaciones entre variables numéricas del dataset
+Hay una relación importante entre 'district_code' y 'region_code' posiblemente un valor deriva de otro. También hay correlaciones importantes entre 'construction_year', 'gps_height', 'latitude' y 'longitude'. Esto es importante pues de haber NA en estas variables, se pueden usar métodos de imputación por regresión. Al tener una correlación entre estos valores, es probable que la edad de las bombas y su ubicación puedan generar señal importante para el modelo.
+
+```{r corrs}
+# Generamos una figura con las correlaciones (Pearson) entre variables:
+cor_plot <- inspect_cor(tt)
+show_plot(cor_plot)
+```
+
+## Valores faltantes (NA)
+Para la figura debajo, se excluye los valores NA creados para la columna 'status_group' (que diferencian al train del test). Dicha columna no presenta valores NA desde el origen. 'public_meeting' y 'permit' poseen un considerable número de NA.
+
+```{r Nas, fig.height=7, fig.width=10}
+# missingness barplot
+na_plot <- inspect_na(tt[,-match('status_group', colnames(tt))])
+show_plot(na_plot)
+```
+
+Según la figura, no existen NA en otras variables, pero para estar seguros, imprimimos el número de NA por variable:
+```{r Nas_print}
+# Na por variable:
+sort(sapply(tt,function(x) sum(is.na(x)==T)), decreasing = T)
+```
+
+No necesariamente valores perdidos están codificados como NA. La figura debajo muestra el histograma de cada variable numérica. Hay valores 0 para 'construction_year', 'gps_height', 'latitude', 'longitude' y 'population', que se asumen como valores perdidos. 
+
+```{r hists}
+Filter(is.numeric, tt) %>%
+  gather(na.rm=T, factor_key = T) %>% # Mantengo el orden del set e ignoro los NA
+  ggplot(aes(value)) +                     
+  facet_wrap(~ key, scales = "free") +   
+  geom_histogram(fill='cornflowerblue') +
+  theme(strip.text = element_text(size=7)) + 
+  theme(axis.text=element_text(size=5))
+```
+
+## Exploración geográfica
+Debajo mostramos un mapa con la ubicación de las bombas y su estado de funcionamiento. Se puede ver que existen regiones donde predomina un estado de las bombas, así que las variables geográficas podrían ser muy buenas predictoras en el modelo. 
+
+```{r leaflet_map}
+map_train <- train[train$longitude != 0,]
+datos_map <- data.frame(status=as.vector(map_train$status_group),
+                        longx=as.vector(map_train$longitude),
+                      laty=as.vector(map_train$latitude))
+
+functional <- subset(datos_map, datos_map$status == 'functional')
+functional_needs <- subset(datos_map, datos_map$status == 'functional needs repair')
+non_functional <- subset(datos_map, datos_map$status == 'non functional')
+
+leaflet(data=datos_map, options = leafletOptions(zoomControl = TRUE,
+                                 minZoom = 6, maxZoom = 6)) %>%
+  addProviderTiles(providers$CartoDB.Positron)%>%
+  addCircleMarkers(data=non_functional,
+                   lng=~longx, 
+                   lat=~laty, 
+                   color = 'red', 
+                   radius = 0.8, 
+                   stroke = FALSE, 
+                   fillOpacity = 0.3, group = 'non_functional') %>%
+  addCircleMarkers(data=functional_needs,
+                   lng=~longx, 
+                   lat=~laty, 
+                   color = 'orange', 
+                   radius = 0.8, 
+                   stroke = FALSE, 
+                   fillOpacity = 0.3, group = 'functional_needs_repair') %>%
+  addCircleMarkers(data=functional,
+                   lng=~longx, 
+                   lat=~laty, 
+                   color = 'green', 
+                   radius = 0.8, 
+                   stroke = FALSE, 
+                   fillOpacity = 0.3, group = 'functional') %>%
+  addLayersControl(overlayGroups = c('non_functional', 'functional_needs_repair', 'functional'),
+    options = layersControlOptions(collapsed = FALSE))
+
+```
+
+Esta relación entre la ubicación y el estado de las bombas también se puede ver al pintar un histograma de los valores de latitud y longitud respecto al estado de las bombas.
+
+```{r hists_lat_long}
+a <- Histograma_categorias(train$latitude, 'Relación de valores de latitud con la target')
+b <- Histograma_categorias(train$longitude, 'Relación de valores de longitud con la target')
+grid.arrange(a,b, ncol=1)
+```
+
+## Otras relaciones interesantes de las variables con la target
+
+Las figuras a continuación muestran la relación de los 3 valores de la target con cada valor de las variable categóricas: 'uqnatity_group', 'waterpoint_type' y 'water_quality'. Algunas de las categorías en estas variables parecen tener buen poder predictivo, al tener predominancia de alguna de las clases de la target.
+
+
+```{r mosaico_quantity}
+Mosaico(train$quantity_group, train$status_group, 'Quantity group')
+```
+
+```{r mosaico_wtr}
+Mosaico(train$waterpoint_type, train$status_group, 'Waterpoint type')
+```
+
+```{r mosaico_wtr_qual}
+Mosaico(train$water_quality, train$status_group, 'Water quality')
+```
+
+
+
+
+
+
+
+# Parte II: Aporte adicional individual
+
+
+## Limpiar el dataset y Feature Engineering I. Pasos que voy a seguir:
+
+1. Cargar los datasets de nuevo y eliminar las filas duplicadas de 'train'
+2. Convertir valores que no tienen interpretación a NA (variables: construction_year, gps_height, longitude y latitude)
+3. Imputación de NAs
+4. Eliminar variables repetidas
+
+### Cargo datasets y elimino duplicados
+```{r cargar_datasets}
+# Importo datos iniciales
+labels <- as.data.frame(fread('C:/Users/pablo/Desktop/label.csv'))
+values <- as.data.frame(fread('C:/Users/pablo/Desktop/train.csv'))
+test <- as.data.frame(fread('C:/Users/pablo/Desktop/test.csv'))
+
+# Creo dataset conjunto de train y test para transformaciones:
+values$set <- c('train') 
+test$set <- c('test')
+data <- rbind(values, test) 
+```
+
+
+
+```{r }
+# Elimino duplicados
+duplicated(select(values, -id)) %>% sum()
+values <- values[!duplicated(select(values, -id)),] 
+duplicated(select(values, -id)) %>% sum() 
+```
+
+
+
+
+### Valores incoherentes a NA
+```{r }
+unique(data$construction_year)[order(unique(data$construction_year))][1:5] 
+freq = as.data.frame(table(data$construction_year))
+freq[order(freq$Freq, decreasing=T),][1:5,]
+```
+
+
+
+
+### Año de construcción tiene valores 0, las cuales van a ser convertidos a NA
+Primero hago una transformación restando los valores por 1960, que es el valor mínimo después de cero.
+Para pasar los ceros a NA, simplemente convierto los valores negativos (0-1960 < 0) de la transformación a NA.
+```{r }
+# minimo tras el cero
+min_year<- min(data$construction_year[data$construction_year > 0]) 
+
+# transformacion
+data$construction_year<-data$construction_year-min_year
+
+# Valores negativos a NA
+data$construction_year[data$construction_year<0]= NA 
+```
+
+
+
+
+### gps_height mide la altitud (con respecto al mar) donde se encuentra el pozo. 
+```{r }
+summary(data$gps_height)
+freq = as.data.frame(table(data$gps_height))
+freq[order(freq$Freq, decreasing=T),][1:5,] 
+```
+
+
+
+
+Convierto valores negativos a NA
+```{r }
+#Set missing gps_height values to the median of gps_height
+data$gps_height[data$gps_height<0] = NA
+```
+
+
+
+
+pozos con longitude cero no tiene sentido porque tanzania se encuentra muy alejada de la longitude cero.
+La latitude en Tanzania no supera -0.1
+Por tanto, convierto estos valores a NA
+```{r }
+data$latitude = ifelse(data$latitude > - 0.1, NA, data$latitude) 
+data$longitude = ifelse(data$longitude == 0, NA, data$longitude) 
+```
+
+
+
+Valores NA de public_meeting y permit son convertidos en una nueva categoría llamada 'unknown'
+```{r }
+data$public_meeting[is.na(data$public_meeting)] = 'unknown'
+data$permit[is.na(data$permit)] = 'unknown'
+```
+
+
+
+
+### Visualización de NAs por variable
+```{r }
+NAs = data.frame(sapply(data, function(x) sum(is.na(x)))) 
+NAs$vars = names(data)
+names(NAs) = 'Number_of_NAs'
+
+NAs = as.data.frame(NAs[order(NAs$Number_of_NAs, decreasing = T),])              
+as.data.frame(NAs[1:7,])                         
+  
+```
+
+
+
+
+### Imputación por missRanger():
+Esta es una forma muy sofisticada de imputar los valores omitidos. Sin embargo, la imputación por missRanger() no me dia una accuracy tan buena como otras opciones. 
+Dejo el código como comentario
+```{r }
+# # Imputación de NAs con missRanger()
+# # Definimos un dataset temporal sin variables categóricas con muchos niveles (missRanger no puede usar estas variables)
+# data=as.data.frame(data)
+# data_temp <- data[,c('quantity', 'longitude', 'latitude', 'gps_height', 'construction_year')] 
+
+# # Imputamos los valores nulos:
+# data_non_NA <- missRanger(data_temp, pmm.k = 3, splitrule = "extratrees", num.trees = 100) 
+
+# data_non_NA %>% is.na() %>% sum() 
+
+# for (col in c('longitude', 'latitude', 'gps_height', 'construction_year')) {    
+#     data[, col] = data_non_NA[, col]    
+# }
+
+# sum(is.na(data)) 
+```
+
+
+### Curiosamente, la mejor forma (en términos de accuracy) de imputar valores omitidos fue con la mediana.
+```{r }
+# Best accuracy using median() 
+data$construction_year[is.na(data$construction_year)] = median(data$construction_year, na.rm=T)
+data$longitude[is.na(data$longitude)] = median(data$longitude, na.rm=T)
+data$latitude[is.na(data$latitude)] = median(data$latitude, na.rm=T)
+data$gps_height[is.na(data$gps_height)] = median(data$gps_height, na.rm=T)
+
+sum(is.na(data))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Feature Engineering I:
+1. Nuevas variables con latitude y longitude
+2. Extraer año y mes del año en el se que grabaron los datos del pozo (date_recorded)
+3. Limpieza de la variable scheme_management
+4. Convertir region_code y district_code a factor.
+5. Nueva variable geográfica: cercanía a grandes lagos
+
+### Nuevas variables con latitude y longitude. Calculo la hipotenusa de los catetos latitud y longitude; creo funciones con sin()/cos() para identificar comportamientos cíclicos.
+```{r }
+data$lat_long=sqrt(data$longitude^2+ data$latitude^2) 
+data$x <- cos(data$latitude) * cos(data$longitude)
+data$y <- cos(data$latitude) * sin(data$longitude)
+data$z <- sin(data$latitude) 
+```
+
+
+
+### Convierto date_recorded a formato fechas. Creo una nueva variable date_recorded_year restando el año a su valor mínimo. Creo una nueva variable con los meses, llamada 'date_recorded_month'.
+```{r }
+data$date_recorded<-as.Date(data$date_recorded) 
+
+data$date_recorded_year <- year(data$date_recorded) 
+
+data$date_recorded_year = (data$date_recorded_year - min(data$date_recorded_year))
+table(data$date_recorded_year) 
+
+data$date_recorded_month <- month(data$date_recorded) 
+table(data$date_recorded_month) 
+```
+
+
+
+
+
+### En scheme_management, agrupo las variables que pertenecen al mismo grupo (i.e., instituciones guvernamentales, compañías privadas, etc.). Las categorías con menos frecuencia son agrupadas en 'other'.
+```{r }
+freq = as.data.frame(table(data$scheme_management))
+freq[order(freq$Freq, decreasing=T),]
+
+# juan carlos scheme_management
+# scheme management agrupo categorÃ?as poco representadas y tambiÃ©n por similitud:
+data$scheme_management <- ifelse(data$scheme_management == 'None' | data$scheme_management == 'SWC' | data$scheme_management == 'Trust' | data$scheme_management == '', 'Other', data$scheme_management) 
+data$scheme_management <- ifelse(data$scheme_management == 'Company' | data$scheme_management == 'Private operator', 'Privates-Non-Statal', data$scheme_management)
+data$scheme_management <- ifelse(data$scheme_management == 'Parastatal' | data$scheme_management == 'Water authority' | data$scheme_management == 'WUA' | data$scheme_management == 'WUG' | data$scheme_management == 'Water Board', 'Water Boards (Statal)', data$scheme_management) 
+
+freq = as.data.frame(table(data$scheme_management))
+freq[order(freq$Freq, decreasing=T),] 
+
+
+```
+
+
+
+
+
+### Convierto region_code y district_code a factor
+```{r }
+#Set region_code and district_code as a factors
+data$region_code<-factor(data$region_code)
+data$district_code<-factor(data$district_code) 
+```
+
+
+
+
+
+### variable geográfica:  cercanía de los pozos a grandes lagos.
+Primero marco puntos que representan los lagos:
+```{r }
+lat = c(-1.223052, -5.419148, -6.991859, -8.298470, -8.059230, -9.893099, -11.221510)
+lng = c(32.729940, 29.522486, 30.094157, 30.819739, 32.160966, 33.770012, 34.447648)  
+
+my_1st_map = leaflet()  %>% 
+    addTiles()
+
+check = my_1st_map  %>% 
+    addMarkers(lat=lat, lng=lng)
+
+check
+
+```
+
+
+Identifico el punto (el cual representa los grandes lagos) más cercano al pozo y mido su distancia.
+```{r }
+lat = c(-1.223052, -5.419148, -6.991859, -8.298470, -8.059230, -9.893099, -11.221510)
+lng = c(32.729940, 29.522486, 30.094157, 30.819739, 32.160966, 33.770012, 34.447648)   
+
+values=c()
+for (i in 1:nrow(data)) {
+    values=c(values, min(abs(data$longitude[i] - lng) + abs(data$latitude[i] - lat)))
+}
+closeness_to_lake = values
+
+data$closeness_to_big_lakes = cut(closeness_to_lake, 5, labels=c('high','medium_high','medium',
+                                                               'medium_low','low')) 
+
+
+```
+
+
+### Visualización de la variable
+```{r }
+data_map=data[,c('latitude','longitude','closeness_to_big_lakes')]
+
+palette = colorFactor(c('darkgreen', 'red','darkolivegreen3','green','darkorange'), 
+                      domain=c('high','medium_high','medium','medium_low','low')) 
+
+leaflet(data_map) %>% addTiles() %>% 
+    addCircleMarkers(
+        color=~palette(closeness_to_big_lakes),
+        radius=1,
+        stroke=F, fillOpacity=0.4
+    )  %>% 
+    addMarkers(lat=lat, lng=lng)  %>% 
+    addLegend("bottomright", pal = palette, values = ~closeness_to_big_lakes) 
+```
+
+
+
+
+
+
+## Selección de variables: El objetivo es quitar variables redundantes.
+### num_private es la única variable de este dataset que carece de descripción. Elimino esta varaible
+### Variables geográficas.
+Como ya sabemos, las variables más importantes son latitude y longitude. Gran parte del apartado de feature engineering ha sido crear nuevas variables a parir de estas.
+Sin embargo, hay otras variables que también aportan información sobre la localización. Voy a eliminar estas variables porque entiendo que latitud y longitud son las que aportan la información más detallada sobre la localización geográfica.
+Por tanto, las otras variables acaban siendo redundantes.
+```{r }
+data$district_code<-NULL
+data$region<-NULL
+data$region_code<-NULL
+data$subvillage<-NULL
+data$ward<- NULL
+```
+
+
+### extraction_type_group y extractoin_type se parecen mucho a extraction_type_class
+```{r }
+data$extraction_type_group<-NULL
+data$extraction_type<-NULL
+```
+
+
+
+```{r }
+data$num_private<-NULL
+```
+
+
+### recorded_by solo tiene un valor único. Esta variable no es útil.
+```{r }
+data$recorded_by<-NULL
+```
+
+
+### Esta variable categórica tiene mas de 40000 valores únicos para un dataset de 75000 filas. Dado que voy a usar xgboost como modelo, al convertir esta variable a númerica, da igual si por label encoding o remplazando categoría por su frecuencia, la variable transformada no va a ser útil.
+```{r }
+data$wpt_name<-NULL
+```
+
+
+
+### payment_type se parece mucho a payment
+```{r }
+data$payment_type<-NULL
+```
+
+
+### water_quality se parece mucho a quality_group
+```{r }
+data$water_quality<-NULL
+```
+
+
+### management se parece mucho a scheme_management
+```{r }
+data$management<-NULL
+```
+
+
+
+### waterpoint_type_group se parece mucho a waterpoint_type
+```{r }
+data$waterpoint_type_group<-NULL
+```
+
+
+### quantity_group se parece mucho a quantity
+```{r }
+data$quantity_group<-NULL
+```
+
+
+### Luego añadiré status_group ordenado por la variable id
+```{r }
+data$status_group = NULL
+```
+
+### installer empeora el accuracy del modelo final
+```{r }
+data$installer = NULL
+```
+
+
+
+
+## Feature engineering II: voy a tocar alguna de las variables categóricas restantes.
+
+```{r }
+categ_vars = unlist(sapply(data, function(x) class(x)=='factor' | class(x) == 'character'))
+categ_vars = names(data[, categ_vars]) 
+
+unique_values = as.data.frame(sapply(data[,categ_vars], function(x) length(unique(x)))) 
+names(unique_values) = 'number_of_unique_values' 
+unique_values$vars = rownames(unique_values)
+unique_values[order(unique_values$number_of_unique_values, decreasing=T),]
+```
+
+
+
+
+
+### Las variables con pocos valores únicos las voy a mantener tal y como están. No voy a realizar agrupaciones.
+```{r }
+
+for (col in categ_vars[!(categ_vars %in% c('funder','lga','scheme_name'))]) {
+    print(col)
+    print(table(data[,col]))
+}
+```
+
+
+### funder tiene niveles que podrían formar una única categoría
+```{r }
+check = tolower(data$funder)
+check = ifelse(grepl("^$|0", check), 'unknown', check) 
+check = ifelse(grepl("church|mosque", check), 'religious', check) 
+check = ifelse(grepl('finn water|fini water|fin water', check), 'fini', check)
+check = ifelse(grepl('kkk', check), 'kkkt', check)
+check = ifelse(grepl('netherl|holland', check), 'netherlands', check)
+check = ifelse(grepl('government/ world bank|world bank/government', check), 
+               'government/ world bank', check)
+check = ifelse(grepl('danid', check), 'danida', check)
+check = ifelse(grepl('esaw', check), 'hesawa', check)
+check = ifelse(grepl('rws', check), 'rwssp', check)
+check = ifelse(grepl('asaf', check), 'tasaf', check)
+check = ifelse(grepl('dhv', check), 'dhv', check)
+check = ifelse(grepl('dwsp', check), 'dwsp', check)
+check = ifelse(grepl('norad', check), 'norad', check)
+
+# unique(check[grepl('norad', check)])  
+data$funder = check
+```
+
+
+
+
+
+### En scheme_name voy a juntar '' y 'None' en la misma categoría
+```{r }
+# scheme_name (definición)- Who operates the waterpoint
+freq = as.data.frame(table(data$scheme_name))
+freq[order(freq$Freq, decreasing=T),][1:10,] 
+
+data$scheme_name = ifelse(grepl("^$|None", data$scheme_name), 'None', data$scheme_name) 
+
+
+freq = as.data.frame(table(data$scheme_name))
+freq[order(freq$Freq, decreasing=T),][1:10,] 
+```
+
+
+
+
+### Mas adelante comentare con mas detalle el modelo xgboost que voy a implementar. Es importante mencionar que xgboost solo admite variables númericas. Por tanto, sustituyo las categorías por sus frecuencias.
+```{r }
+data=as.data.table(data)
+
+data[ , funder := .N , by = .(funder)]
+data[ , basin := .N , by = .(basin)] 
+data[ , lga := .N , by = .(lga)]
+data[ , public_meeting := .N , by = .(public_meeting)]
+data[ , scheme_name := .N , by = .(scheme_name)]
+data[ , permit := .N , by = .(permit)]
+data[ , extraction_type_class := .N , by = .(extraction_type_class)]
+data[ , scheme_management := .N , by = .(scheme_management)]
+data[ , management_group := .N , by = .(management_group)]
+data[ , payment := .N , by = .(payment)]
+data[ , quality_group := .N , by = .(quality_group)]
+data[ , quantity := .N , by = .(quantity)]
+data[ , source := .N , by = .(source)]
+data[ , source_type := .N , by = .(source_type)]
+data[ , source_class := .N , by = .(source_class)]
+data[ , waterpoint_type := .N , by = .(waterpoint_type)]
+
+
+data=as.data.frame(data) 
+```
+
+
+
+
+
+
+
+
+
+## Modelo: Xgboost
+El modelo prpuesto está basado en el ejercicio resuelto que compartió MattBrown88 en github: [link_github](https://github.com/MattBrown88/Pump-it-Up-XGBoost-Ensemble/blob/master/Water_solution%20-%20xgboost%2045.R)
+
+
+### Pasos a realizar:
+### Parte I: grid serach de parámetros. Pasos:
+
+1. Partición train test. Dentro de train, hago particion my_train/my_test para sacar el accuracy de cada una de las combinaciones de parámetros. 
+2. Grid serach. Parámetros a optimizar: booster, eval_metric, eta, early_stopping_rounds, maximize, colsample_bytree, nrounds, max_depth y num_class.
+
+
+### Parte II: optimización de nrounds y las semillas. Pasos:
+
+1. Partición train test.
+2. Convertir status_group en variable númerica con el método de label encoding.
+3. Usar xgb.DMatrix para preparar los datos al modelo xgboost.
+4. Una vez que ya conocemos la mejor combinación de los parámetros ya mencionados en la parte 1, voy a identificar el valor óptimo de nrounds para los modelos finales, utilizando xgb.cv().
+5. xgb.cv tiene el atributo '$evaluation_log' que nos devuelve una matriz con las columnas 'iter', 'train_merror_mean', 'train_merror_std', 'test_merror_mean' y 'test_merror_std'. Es mejor fijarse en los datos de 'test' porque los de 'train' pueden estar sujetos al overfitting y estar algo 'inflados'. 
+6. Busco el número de iteración que minimiza 'test_merror_mean'. Este valor es el que usaré en el modelo final.
+7. Dado que la efectividad del modelo se puede ver afectada por la aleatoridad de las semillas. Hago un bucle 'for' con distintos valores para las semillas. Importante: cada semilla arrajorá un modelo con el parámetro nrounds optimizado y con sus respectivas predecciones.
+8. Cada una de estas predicciones son almacenadas en el data.frame 'solution.table'. De esta manera, solo quedar hacer una votación usando las predicciones de cada unos de los modelos para seleccionar una predicción definitiva de cada pozo.
+9. Vuelvo a convertir la variable objetivo a su estado original (de labelEncoding a variable categórica) y preparo el dataset que voy a subir. 
+
+
+
+
+
+### Partición train test. Dentro de train, hago particion my_train/my_test para sacar el accuracy de cada una de las combinaciones de parámetros.
+```{r }
+data_train <- data[data$set=='train',]
+data_test <- data[data$set=='test',]
+
+# # merbe train labels
+train <- merge(as.data.frame(data_train), as.data.frame(labels), by='id')
+map = setNames(0:2, unique(train$status_group)) 
+train$status_group[] = map[unlist(train$status_group)]
+train$status_group = as.numeric(train$status_group)
+
+set.seed(7)
+validationIndex <- createDataPartition(train$status_group, p = 0.80, list = FALSE)
+
+
+my_test  <- train[-validationIndex,]
+my_train <- train[validationIndex,] 
+
+target <- my_train$status_group 
+y_test = my_test$status_group
+
+my_test<-subset(my_test, select = c(-id, -set, -status_group)) 
+my_train<-subset(my_train, select = c(-id, -set, -status_group))
+
+my_test <- as.matrix(as.data.frame(lapply(my_test, as.numeric)))
+my_train <- as.matrix(as.data.frame(lapply(my_train, as.numeric)))
+```
+
+
+
+```{r }
+train.DMatrix <- xgb.DMatrix(data = my_train,label = target, missing = NA) 
+```
+
+
+
+### Grid Search:
+Parámetros a optimizar: booster, eval_metric, eta, early_stopping_rounds, maximize, colsample_bytree, nrounds, max_depth y num_class.
+```{r }
+booster <- c('gbtree')
+eval_metric <- c('mlogloss','merror')  
+eta = c(0.2, 0.5)
+early_stopping_rounds = c(10,20) 
+maximize = c(T, F)
+colsample_bytree = c(0.1, 0.4) 
+nrounds = c(200, 500)
+max_depth= c(12, 15)
+num_class = c(3, 4) # técnicamente el número de clases es 3. Sin embargo, a veces especificando a xgboost que hay una clase más permite mejorar la accuracy del modelo
+
+
+grid  <- expand.grid(booster, eval_metric, eta, early_stopping_rounds, maximize, 
+                     colsample_bytree, nrounds, max_depth, num_class) 
+
+nrow(grid)
+grid[1:3,]
+```
+
+
+
+
+
+### Realizo tantos modelos como filas tiene el grid search.
+```{r GridSerach, results='hide'}
+booster <- c()
+eval_metric <- c()  
+eta = c()
+early_stopping_rounds = c() 
+maximize = c()
+colsample_bytree = c()
+nrounds = c()
+max_depth= c()
+num_class = c()
+accuracy = c() 
+
+for (i in 1:nrow(grid)) {
+    booster_p = as.character(grid[i,1]) 
+    eval_metric_p = as.character(grid[i,2]) 
+    eta_p = grid[i,3] 
+    early_stopping_rounds_p = grid[i,4]
+    maximize_p = grid[i,5]
+    colsample_bytree_p = grid[i,6] 
+    nrounds_p = grid[i,7]
+    max_depth_p = grid[i,8]
+    num_class_p = grid[i,9]
+    
+    model= xgboost(data = train.DMatrix, objective = "multi:softmax", booster = booster_p,
+                         eval_metric = eval_metric_p, nrounds = nrounds_p, 
+                         early_stopping_rounds = early_stopping_rounds_p,
+                         maximize = maximize_p,
+                         num_class = num_class_p, eta = eta_p, max_depth = max_depth_p, 
+                         colsample_bytree = colsample_bytree_p) 
+    
+    booster = c(booster, booster_p) 
+    eval_metric = c(eval_metric, eval_metric_p) 
+    eta = c(eta, eta_p) 
+    early_stopping_rounds = c(early_stopping_rounds, early_stopping_rounds_p)
+    maximize = c(maximize, maximize_p)
+    colsample_bytree = colsample_bytree_p 
+    nrounds = nrounds_p
+    max_depth = max_depth_p
+    num_class = c(num_class, num_class_p)
+
+    predict <- predict(model, my_test)
+
+    acc = sum(predict==y_test)/length(predict)
+    accuracy = c(accuracy, acc)
+}
+```
+
+
+
+
+
+
+```{r }
+grid_outcome = data.frame(accuracy, booster, eval_metric, eta, early_stopping_rounds, 
+                          maximize, colsample_bytree, nrounds, max_depth, num_class)
+grid_outcome[order(grid_outcome$accuracy, decreasing=TRUE),][1:7,]
+values = grid_outcome[grid_outcome$accuracy == max(grid_outcome$accuracy), ]
+values
+```
+
+
+
+
+
+### Pasos:
+1. Partición train test 
+2. Convertir status_group en variable númerica con el método de label encoding.
+```{r }
+data_train <- data[data$set=='train',]
+data_test <- data[data$set=='test',]
+
+
+data_test.noID<-subset(data_test, select = c(-id, -set)) 
+
+data_train<-subset(data_train, select = c(-id, -set))
+
+data_test.noID <- as.matrix(as.data.frame(lapply(data_test.noID, as.numeric)))
+data_train <- as.matrix(as.data.frame(lapply(data_train, as.numeric)))
+
+
+
+target=labels
+map = setNames(0:2, unique(target$status_group))
+target$status_group[] = map[unlist(target$status_group)]
+target = as.numeric(target$status_group) 
+data.frame(map) 
+```
+
+
+
+
+
+### Usar xgb.DMatrix para preparar los datos al modelo xgboost.
+```{r }
+train.DMatrix <- xgb.DMatrix(data = data_train,label = target, missing = NA) 
+```
+
+
+
+
+
+### Pasos:
+1. Una vez que ya conocemos la mejor combinación de los parámetros ya mencionados en la parte 1, voy a identificar el valor óptimo de nrounds para los modelos finales, utilizando xgb.cv().
+2. xgb.cv tiene el atributo '$evaluation_log' que nos devuelve una matriz con las columnas 'iter', 'train_merror_mean', 'train_merror_std', 'test_merror_mean' y 'test_merror_std'. Al ser una validación cruzada, los valores que nos devuelve son valores medios. Es mejor fijarse en los datos de 'test' porque los de 'train' pueden estar sujetos al overfitting y estar algo 'inflados'. 
+3. Busco el número de iteración que minimiza 'test_merror_mean'. Este valor es el que usaré en el modelo final.
+4. Dado que la efectividad del modelo se puede ver afectada por la aleatoridad de las semillas. Hago un bucle for con distintos valores para las semillas. Importante: cada semilla arrajorá un modelo con el parámetro nrounds optimizado y con sus respectivas predecciones.
+5. Cada una de estas predicciones son almacenadas en el data.frame 'solution.table'. De esta manera, solo quedar hacer una votación usando las predicciones de cada unos de los modelos para seleccionar una predicción definitiva de cada pozo.
+```{r cross_validation, results='hide'}
+# donde guardo las predicciones
+solution.table<-data.frame(id=data_test[,"id"])
+
+
+best_booster = values[1,2]
+best_eval_metric = values[1,3]
+best_eta = values[1,4]
+best_early_stopping_rounds = values[1,5]
+best_maximize = values[1,6]
+best_colsample_bytree = values[1,7]
+best_nrounds = values[1,8]
+best_max_depth = values[1,9]
+best_num_class = values[1,10]
+
+
+for (i in 2:12){ # empiezo en 2 porque luego estos valores indicarán la posición de las columnas del dataframe donde
+                 # guardo las predicciones (solution.table)
+
+    set.seed(i)
+
+    xgb.tab = xgb.cv(data = train.DMatrix, objective = "multi:softmax", booster = toString(best_booster),
+                     nrounds = best_nrounds, nfold = 4, early_stopping_rounds = best_early_stopping_rounds, 
+                     num_class = best_num_class, 
+                     maximize = best_maximize, evaluation = best_eval_metric, eta = best_eta, 
+                     max_depth = best_max_depth, 
+                     colsample_bytree = best_colsample_bytree)
+
+    # identifico el número de iteración con el menor 'test_merror_mean' en la validación cruzada. Guardo este valor de 
+    # 'nrounds' como 'min.error.idx'
+    min.error.idx = which.min(as.data.frame(xgb.tab$evaluation_log)$test_merror_mean)
+  
+
+    # modelo con parametro 'nrounds' optimizado
+    model <- xgboost(data = train.DMatrix, objective = "multi:softmax", 
+                     booster = toString(best_booster),
+                     eval_metric = best_eval_metric, 
+                     nrounds = min.error.idx, # mejor valor de la cross_validation
+                     # early_stopping_rounds = best_early_stopping_rounds,  ->quiero gastar las 500 nrounds
+                     # maximize = best_maximize, -> solo funciona cunado early_stopping_rounds es usado
+                     num_class = best_num_class, 
+                     eta = best_eta, 
+                     max_depth = best_max_depth, 
+                     colsample_bytree = best_colsample_bytree)  
+
+
+    predict <- predict(model,data_test.noID)
+
+    # de LabelEncoder a su forma original
+    predict[predict==0]<-"functional"
+    predict[predict==1]<-"non functional"
+    predict[predict==2]<-"functional needs repair"
+    
+    # incluyo la predicción
+    solution.table[,i]<-predict
+} 
+```
+
+
+
+
+
+# mido la importancia de las variables con el modelo de la última semilla.
+```{r }
+importance <- xgb.importance(feature_names = colnames(data_train), model =model)
+importance
+xgb.plot.importance(importance_matrix = importance) 
+```
+
+
+
+
+### última parte:
+1. Cada una de las predicciones fueron almacenadas en el data.frame 'solution.table'. De esta manera, solo queda hacer una votación de las predicciones de cada unos de los modelos para seleccionar la predicción definitiva. 
+2. Preparo el dataset que voy a subir. 
+
+```{r }
+# Primero saco la frecuencia de las 3 categorías (de status_group) por cada fila.
+solution.table.count<-apply(solution.table, MARGIN=1, table)
+
+# Creo un vector donde guardaré la solución final
+predict.combined<-vector()
+
+
+# Identifico la categoría con más votos en cada grupo
+for (x in 1:nrow(data_test)) {
+  predict.combined[x]<-names(which.max(solution.table.count[[x]]))
+}
+
+# distirución de los valores de las predicciones
+table(predict.combined)
+
+#Creo el dataframe que subiré a drivendata
+solution<- data.frame(id=data_test[,"id"], status_group=predict.combined)
+
+#Visualización
+head(solution)
+```
+
+
+
+
+```{r }
+write.csv(solution, file='submission_pablo_b.csv', row.names=F) 
+```
+
+
+![captura_pantalla1](C:/Users/pablo/Desktop/proof_submission.png)
+
+![captura_pantalla2](C:/Users/pablo/Desktop/additional.png)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Conclusiones: 
+
+1. EDA es imprescindible. Cuanto más visual mejor. El objetivo en esta parte es identificar qué características tienen las distintas variables. De esta manera, se puede obtener importantes pistas para hacer futuras modificaciones en el dataset. Alguna de las pistas fueron: 1) había dos variables con NAs, 2) la variable construction_year tenía valores cero, 3) latitude y longitude tenían una densidad de valores significativamente más concentrada en la categoría 'functional' que en 'non functional' y 'functional needs repair'.
+
+2. Feature Engineering: no solo es importante limpiar las columnas originales, sino que también hay que crear variables nuevas de las anteriores. El objetivo con estas nuevas variables es facilitar el aprendizaje a los futuros modelos que usaremos para predecir el estado de los pozos en Tanzania. Las nuevas variables creadas con latitude y longitude aportaron mucho valor al modelo.
+
+3. Selección de variables: en este dataset en particular, los factores más importantes han sido 1) la eliminación de variables duplicadas, 2) la identificación de variables redundantes (por ejemplo, latitude y longitude ya engloban la informacion que pueda aportar region_code o la variable 'ward' (que es otro tipo de subdivision territorial))  y 3) la eliminación de variables categóricas con muchos valores únicos.
+
+4. Grid Search para los hiperparámetros de los modelos: la historia no acaba con simplemente lanzar un modelo con valores por defecto. Hay que buscar aquella combinación de parámetros que nos permita mejorar las predicciones. (En nuestro caso, el grid search se ha hecho en dos fases: 1) La mayor parte de los parámetros 2) 'nrounds' con xgb.cv() y las semillas). De esta forma, se asegura que el modelo está optimizado para las particularidades del dataset.
+
+5. En ocasiones hay transformaciones que desde el punto de vista teórico tienen validez, pero en la implementación en casos reales, no consiguen aportar valor añadido. En este caso concreto, hacer imputación de NAs con missRanger era menos efectivo que hacerlo con la mediana.
+
+
+## Este es el final. ¡Muchas gracias!
+
+
